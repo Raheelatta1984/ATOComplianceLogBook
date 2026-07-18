@@ -15,7 +15,6 @@ interface GPSPoint {
   lng: number;
   speed: number;
   timestamp: number;
-  heading?: number;
 }
 
 interface ActiveTrip {
@@ -24,19 +23,8 @@ interface ActiveTrip {
   startLng: number;
   startAddress: string;
   startOdometer: number;
-  gpsTrack: GPSPoint[];
-  maxSpeed: number;
-  totalDistance: number;
+  pickupMode: boolean;
 }
-
-// Speed limits by road type (approximate Australia)
-const SPEED_LIMITS: Record<string, number> = {
-  residential: 50,
-  urban: 60,
-  arterial: 80,
-  highway: 110,
-  school: 40,
-};
 
 export default function TripPage() {
   const router = useRouter();
@@ -45,11 +33,11 @@ export default function TripPage() {
   const [odometerInput, setOdometerInput] = useState("");
   const [endOdometerInput, setEndOdometerInput] = useState("");
   const [isBusinessTrip, setIsBusinessTrip] = useState(true);
+  const [pickupMode, setPickupMode] = useState(false);
   const [notes, setNotes] = useState("");
   const [todayCount, setTodayCount] = useState(0);
   const [elapsed, setElapsed] = useState("00:00");
   const [currentSpeed, setCurrentSpeed] = useState(0);
-  const [currentAddress, setCurrentAddress] = useState("");
   const [speedAlert, setSpeedAlert] = useState<SpeedAlertType>(null);
   const [alertMsg, setAlertMsg] = useState("");
   const [stopSuggestion, setStopSuggestion] = useState(false);
@@ -58,16 +46,22 @@ export default function TripPage() {
   const [streetName, setStreetName] = useState("");
   const [liveLat, setLiveLat] = useState(-33.8688);
   const [liveLng, setLiveLng] = useState(151.2093);
+  const [movementBanner, setMovementBanner] = useState(false);
 
   const watchIdRef = useRef<number | null>(null);
+  const idleWatchIdRef = useRef<number | null>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const startTimeRef = useRef<number>(0);
   const lastPosRef = useRef<GPSPoint | null>(null);
   const stopTimerRef = useRef<NodeJS.Timeout | null>(null);
   const positionBufferRef = useRef<GPSPoint[]>([]);
   const speedHistoryRef = useRef<number[]>([]);
+  const phaseRef = useRef<Phase>("idle");
+  const moveDetectedCountRef = useRef(0);
 
-  // Fetch today count and last odometer
+  phaseRef.current = phase;
+
+  // Fetch latest odometer + today's count
   const fetchLastOdo = useCallback(() => {
     fetch("/api/last-odo").then(r => r.json()).then(data => {
       if (data.lastOdometer) setLastOdoEnd(data.lastOdometer);
@@ -77,7 +71,46 @@ export default function TripPage() {
 
   useEffect(() => { fetchLastOdo(); }, [fetchLastOdo]);
 
-  // Timer
+  // ===== Movement detection while IDLE (auto-start suggestion) =====
+  useEffect(() => {
+    if (phase !== "idle") {
+      if (idleWatchIdRef.current !== null) {
+        navigator.geolocation.clearWatch(idleWatchIdRef.current);
+        idleWatchIdRef.current = null;
+      }
+      setMovementBanner(false);
+      moveDetectedCountRef.current = 0;
+      return;
+    }
+    if (!navigator.geolocation) return;
+
+    idleWatchIdRef.current = navigator.geolocation.watchPosition(
+      (pos) => {
+        const spd = pos.coords.speed ? pos.coords.speed * 3.6 : 0;
+        // Only suggest if genuinely moving — 2 consecutive readings > 12 km/h
+        if (spd > 12 && phaseRef.current === "idle") {
+          moveDetectedCountRef.current++;
+          if (moveDetectedCountRef.current >= 2) {
+            setMovementBanner(true);
+            setTimeout(() => setMovementBanner(false), 15000);
+          }
+        } else {
+          moveDetectedCountRef.current = 0;
+        }
+      },
+      () => {},
+      { enableHighAccuracy: true, timeout: 8000, maximumAge: 3000 }
+    );
+
+    return () => {
+      if (idleWatchIdRef.current !== null) {
+        navigator.geolocation.clearWatch(idleWatchIdRef.current);
+        idleWatchIdRef.current = null;
+      }
+    };
+  }, [phase]);
+
+  // Timer for driving
   useEffect(() => {
     if (phase === "driving") {
       startTimeRef.current = Date.now();
@@ -97,17 +130,15 @@ export default function TripPage() {
     try {
       const res = await fetch(
         `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18&addressdetails=1`,
-        { headers: { "User-Agent": "TripLog-ATO/2.0" } }
+        { headers: { "User-Agent": "TripLog-ATO/3.0" } }
       );
       const data = await res.json();
       const addr = data.address || {};
       const street = addr.road || addr.pedestrian || addr.street || "";
       const suburb = addr.suburb || addr.city_district || addr.town || "";
-      const state = addr.state || "";
-      const postcode = addr.postcode || "";
       return {
         address: data.display_name || `${lat.toFixed(5)}, ${lng.toFixed(5)}`,
-        street: street ? `${street}${suburb ? ', ' + suburb : ''}` : suburb || "Unknown street",
+        street: street ? `${street}${suburb ? ", " + suburb : ""}` : suburb || "Unknown street",
       };
     } catch {
       return { address: `${lat.toFixed(5)}, ${lng.toFixed(5)}`, street: "Unknown street" };
@@ -122,10 +153,10 @@ export default function TripPage() {
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   };
 
-  // Handle GPS position update
+  // GPS handler — only accumulates distance when actually moving
   const handlePosition = useCallback((pos: GeolocationPosition) => {
     const { latitude: lat, longitude: lng, speed } = pos.coords;
-    const spd = speed ? speed * 3.6 : 0; // m/s to km/h
+    const spd = speed ? speed * 3.6 : 0;
     const point: GPSPoint = { lat, lng, speed: spd, timestamp: Date.now() };
 
     setCurrentSpeed(spd);
@@ -134,30 +165,29 @@ export default function TripPage() {
     positionBufferRef.current.push(point);
     speedHistoryRef.current.push(spd);
 
-    // Calculate GPS distance
-    if (lastPosRef.current) {
+    // GPS distance ONLY grows when moving — stationary = no odo increment
+    if (lastPosRef.current && spd > 3) {
       const segDist = calcDistance(lastPosRef.current.lat, lastPosRef.current.lng, lat, lng);
-      if (segDist > 0.005 && segDist < 2) { // Filter out GPS jitter and bad readings
+      if (segDist > 0.003 && segDist < 2) {
         setGpsDistance(prev => prev + segDist);
       }
     }
     lastPosRef.current = point;
 
-    // Speed limit alert (assume 50km/h default urban)
+    // Speed alert
     if (spd > 55) {
       setSpeedAlert("speed");
       setAlertMsg(`⚠️ Speed: ${Math.round(spd)} km/h — Slow down!`);
-    } else {
-      if (speedAlert === "speed") setSpeedAlert(null);
+    } else if (speedAlert === "speed") {
+      setSpeedAlert(null);
     }
 
-    // Auto-stop detection: if speed 0 for 3 seconds
+    // Stationary 3s → suggest stopping
     if (spd < 1) {
       if (!stopTimerRef.current) {
         stopTimerRef.current = setTimeout(() => {
           setStopSuggestion(true);
-          // Auto-hide after 8 seconds
-          setTimeout(() => setStopSuggestion(false), 8000);
+          setTimeout(() => setStopSuggestion(false), 10000);
         }, 3000);
       }
     } else {
@@ -168,22 +198,20 @@ export default function TripPage() {
       setStopSuggestion(false);
     }
 
-    // Street name update (throttled)
+    // Street name (throttled)
     if (positionBufferRef.current.length % 5 === 0) {
       reverseGeocode(lat, lng).then(({ street }) => setStreetName(street));
     }
   }, [speedAlert]);
 
-  const startGPS = useCallback(() => {
+  const startDrivingGPS = useCallback(() => {
     if (!navigator.geolocation) return;
     watchIdRef.current = navigator.geolocation.watchPosition(handlePosition, () => {}, {
-      enableHighAccuracy: true,
-      timeout: 5000,
-      maximumAge: 2000,
+      enableHighAccuracy: true, timeout: 5000, maximumAge: 2000,
     });
   }, [handlePosition]);
 
-  const stopGPS = useCallback(() => {
+  const stopDrivingGPS = useCallback(() => {
     if (watchIdRef.current !== null) {
       navigator.geolocation.clearWatch(watchIdRef.current);
       watchIdRef.current = null;
@@ -194,27 +222,13 @@ export default function TripPage() {
     }
   }, []);
 
-  useEffect(() => {
-    return () => stopGPS();
-  }, [stopGPS]);
+  useEffect(() => () => stopDrivingGPS(), [stopDrivingGPS]);
 
-  // Background handling
-  useEffect(() => {
-    const handleVisibility = () => {
-      if (phase === "driving" && document.visibilityState === "visible") {
-        // Re-check GPS when coming back to foreground
-        if (!watchIdRef.current) startGPS();
-      }
-    };
-    document.addEventListener("visibilitychange", handleVisibility);
-    return () => document.removeEventListener("visibilitychange", handleVisibility);
-  }, [phase, startGPS]);
-
-  // START TRIP — always fetch latest odometer first
-  const handleStartTrip = async () => {
+  // START TRIP — fresh odometer fetch
+  const handleStartTrip = useCallback(async (isPickup: boolean = false) => {
+    setPickupMode(isPickup);
+    setMovementBanner(false);
     setPhase("starting");
-
-    // Fetch the highest odometer reading fresh
     let freshOdo: number | null = null;
     try {
       const odoRes = await fetch("/api/last-odo");
@@ -224,30 +238,29 @@ export default function TripPage() {
       if (freshOdo) setLastOdoEnd(freshOdo);
     } catch {}
 
-    let lat = -33.8688, lng = 151.2093, address = "Sydney NSW";
+    let lat = liveLat, lng = liveLng, address = "Locating...";
     try {
       const pos = await new Promise<GeolocationPosition>((resolve, reject) => {
         navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: true, timeout: 10000 });
       });
       lat = pos.coords.latitude;
       lng = pos.coords.longitude;
+      setLiveLat(lat);
+      setLiveLng(lng);
       const geo = await reverseGeocode(lat, lng);
       address = geo.address;
       setStreetName(geo.street);
-    } catch { /* use defaults */ }
+    } catch {}
 
     setTrip({
       startTime: new Date().toTimeString().slice(0, 5),
       startLat: lat, startLng: lng, startAddress: address,
-      startOdometer: 0, gpsTrack: [], maxSpeed: 0, totalDistance: 0,
+      startOdometer: 0, pickupMode: isPickup,
     });
-    // Always use the highest odometer — never show 0
-    setOdometerInput(freshOdo ? String(freshOdo) : "");
-    setCurrentAddress(address);
+    setOdometerInput(freshOdo ? freshOdo.toFixed(1) : "");
     setPhase("odometer_start");
-  };
+  }, [liveLat, liveLng]);
 
-  // CONFIRM START ODO → BEGIN DRIVING
   const handleConfirmStartOdometer = () => {
     const odo = parseFloat(odometerInput);
     if (!odo || odo <= 0) return;
@@ -258,36 +271,28 @@ export default function TripPage() {
     positionBufferRef.current = [];
     lastPosRef.current = null;
     setPhase("driving");
-    startGPS();
+    startDrivingGPS();
   };
 
-  // STOP TRIP
   const handleStopTrip = () => {
-    stopGPS();
+    stopDrivingGPS();
     if (trip) {
-      const estDist = Math.round(gpsDistance) || Math.round((parseFloat(elapsed) || 5) * 0.5);
-      setEndOdometerInput(String(trip.startOdometer + Math.max(1, estDist)));
+      const est = trip.startOdometer + Math.max(0.1, gpsDistance);
+      setEndOdometerInput(est.toFixed(1));
     }
     setPhase("odometer_end");
   };
 
-  // SAVE TRIP
   const handleSaveTrip = async () => {
     if (!trip || !endOdometerInput) return;
     setPhase("saving");
     const endOdo = parseFloat(endOdometerInput);
-    let endLat = trip.startLat, endLng = trip.startLng, endAddr = trip.startAddress;
+    let endLat = liveLat, endLng = liveLng, endAddr = "End location";
     try {
-      const pos = await new Promise<GeolocationPosition>((resolve, reject) => {
-        navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: true, timeout: 5000 });
-      });
-      endLat = pos.coords.latitude;
-      endLng = pos.coords.longitude;
       const geo = await reverseGeocode(endLat, endLng);
       endAddr = geo.address;
-    } catch { /* use start location */ }
+    } catch {}
 
-    const odoDist = endOdo - trip.startOdometer;
     const avgSpd = speedHistoryRef.current.length > 0
       ? speedHistoryRef.current.reduce((a, b) => a + b, 0) / speedHistoryRef.current.length
       : 0;
@@ -300,8 +305,8 @@ export default function TripPage() {
           tripDate: new Date().toISOString().split("T")[0],
           startTime: trip.startTime,
           endTime: new Date().toTimeString().slice(0, 5),
-          startOdometer: trip.startOdometer,
-          endOdometer: endOdo,
+          startOdometer: trip.startOdometer.toFixed(2),
+          endOdometer: endOdo.toFixed(2),
           pickupAddress: trip.startAddress,
           pickupLat: trip.startLat,
           pickupLng: trip.startLng,
@@ -309,22 +314,22 @@ export default function TripPage() {
           dropoffLat: endLat,
           dropoffLng: endLng,
           isBusinessTrip,
-          tripPurpose: notes || undefined,
+          tripPurpose: trip.pickupMode ? "🚕 Passenger pickup run" : (notes || undefined),
           notes: notes || undefined,
           source: "gps",
           gpsTrack: positionBufferRef.current.slice(-500),
-          maxSpeed: Math.round(Math.max(trip.maxSpeed, ...speedHistoryRef.current) * 10) / 10,
+          maxSpeed: Math.round(Math.max(...speedHistoryRef.current) * 10) / 10,
           avgSpeed: Math.round(avgSpd * 10) / 10,
           gpsDistanceKm: Math.round(gpsDistance * 100) / 100,
         }),
       });
-
       if (res.ok) {
+        const tripJson = await res.json();
         // Save daily odometer end
         fetch("/api/daily-odo", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ endOdometer: endOdo }),
+          body: JSON.stringify({ endOdometer: endOdo.toFixed(2) }),
         });
         setPhase("done");
         setTodayCount(c => c + 1);
@@ -336,18 +341,12 @@ export default function TripPage() {
     }
   };
 
-  const handleNextTrip = async () => {
-    // Fetch the latest odometer before resetting
-    try {
-      const odoRes = await fetch("/api/last-odo");
-      const odoData = await odoRes.json();
-      if (odoData.lastOdometer) setLastOdoEnd(odoData.lastOdometer);
-      if (odoData.todayCount !== undefined) setTodayCount(odoData.todayCount);
-    } catch {}
+  const handleNextTrip = () => {
     setTrip(null);
     setOdometerInput("");
     setEndOdometerInput("");
     setNotes("");
+    setPickupMode(false);
     setElapsed("00:00");
     setGpsDistance(0);
     setCurrentSpeed(0);
@@ -356,34 +355,58 @@ export default function TripPage() {
     speedHistoryRef.current = [];
     positionBufferRef.current = [];
     lastPosRef.current = null;
+    fetchLastOdo();
     setPhase("idle");
   };
 
-  const nextTripOdo = lastOdoEnd || (trip?.startOdometer ? trip.startOdometer + Math.round(gpsDistance || 1) : 0);
+  // live estimated odometer while driving
+  const liveOdo = trip ? trip.startOdometer + gpsDistance : 0;
 
   // ===== IDLE =====
   if (phase === "idle") {
     return (
       <div className="min-h-[85vh] flex flex-col items-center justify-center pb-32 animate-fadeIn">
-        <p className="text-slate-400 text-sm mb-2">Trip #{todayCount + 1} today</p>
-        {lastOdoEnd && (
-          <p className="text-xs text-slate-400 mb-6">Last odometer: {fmtOdo(lastOdoEnd)} km</p>
+        {movementBanner && (
+          <div className="fixed top-20 left-1/2 -translate-x-1/2 z-50 bg-indigo-600 text-white px-6 py-4 rounded-2xl shadow-2xl animate-fadeIn max-w-sm text-center">
+            <p className="font-bold">🚗 You&apos;re moving!</p>
+            <p className="text-sm text-white/80 mt-1">Want to start a trip?</p>
+            <div className="flex gap-2 mt-3">
+              <button onClick={() => handleStartTrip(false)}
+                className="flex-1 py-2 bg-white text-indigo-700 rounded-xl text-sm font-bold">Start Trip</button>
+              <button onClick={() => setMovementBanner(false)}
+                className="px-4 py-2 bg-white/20 text-white rounded-xl text-sm">Ignore</button>
+            </div>
+          </div>
         )}
-        <button onClick={handleStartTrip}
-          className="w-52 h-52 rounded-full bg-gradient-to-br from-green-500 to-emerald-600 text-white shadow-2xl active:scale-95 transition-all flex flex-col items-center justify-center">
-          <span className="text-6xl mb-2">▶</span>
-          <span className="text-2xl font-bold">START</span>
-          <span className="text-sm opacity-80">Trip #{todayCount + 1}</span>
-        </button>
-        <div className="mt-8 flex gap-3">
+
+        <div className="text-center mb-8">
+          <h1 className="text-2xl font-bold text-slate-900">TripLog</h1>
+          <p className="text-slate-500 text-sm mt-1">Trip #{todayCount + 1} today</p>
+          {lastOdoEnd && (
+            <p className="text-xs text-slate-400 mt-1">Odometer: {fmtOdo(lastOdoEnd)} km</p>
+          )}
+        </div>
+
+        <div className="grid grid-cols-2 gap-4 w-full max-w-sm">
+          <button onClick={() => handleStartTrip(false)}
+            className="h-40 rounded-3xl bg-gradient-to-br from-green-500 to-emerald-600 text-white shadow-xl active:scale-95 transition-all flex flex-col items-center justify-center">
+            <span className="text-4xl mb-2">▶</span>
+            <span className="font-bold">START TRIP</span>
+            <span className="text-xs opacity-80 mt-1">Passenger on board</span>
+          </button>
+          <button onClick={() => handleStartTrip(true)}
+            className="h-40 rounded-3xl bg-gradient-to-br from-amber-500 to-orange-600 text-white shadow-xl active:scale-95 transition-all flex flex-col items-center justify-center">
+            <span className="text-4xl mb-2">🚕</span>
+            <span className="font-bold">PICKUP MODE</span>
+            <span className="text-xs opacity-80 mt-1">Going to get passenger</span>
+          </button>
+        </div>
+
+        <div className="flex gap-3 mt-6">
           <button onClick={() => router.push("/manual-trip")}
-            className="px-5 py-3 bg-white border border-slate-200 rounded-xl text-sm text-slate-600 hover:bg-slate-50">
-            ✏️ Manual Entry
-          </button>
+            className="px-5 py-3 bg-white border border-slate-200 rounded-xl text-sm text-slate-600">✏️ Manual</button>
           <button onClick={() => router.push("/history")}
-            className="px-5 py-3 bg-white border border-slate-200 rounded-xl text-sm text-slate-600 hover:bg-slate-50">
-            📋 History
-          </button>
+            className="px-5 py-3 bg-white border border-slate-200 rounded-xl text-sm text-slate-600">📋 History</button>
         </div>
       </div>
     );
@@ -395,7 +418,7 @@ export default function TripPage() {
       <div className="min-h-[85vh] flex flex-col items-center justify-center pb-32 animate-fadeIn">
         <div className="w-44 h-44 rounded-full bg-amber-100 flex flex-col items-center justify-center animate-pulse-slow">
           <span className="text-5xl mb-2">📡</span>
-          <span className="text-lg font-medium text-amber-700">Getting Location...</span>
+          <span className="text-lg font-medium text-amber-700">Getting GPS...</span>
         </div>
       </div>
     );
@@ -407,9 +430,11 @@ export default function TripPage() {
       <div className="min-h-[85vh] flex flex-col items-center justify-center pb-32 animate-fadeIn">
         <div className="w-full max-w-sm space-y-5">
           <div className="text-center">
-            <span className="text-4xl">📏</span>
-            <h2 className="mt-3 text-xl font-bold text-slate-900">Start Odometer</h2>
-            <p className="text-sm text-slate-500 mt-1">Read your dashboard — enter current km</p>
+            <span className="text-4xl">{pickupMode ? "🚕" : "📏"}</span>
+            <h2 className="mt-3 text-xl font-bold text-slate-900">
+              {pickupMode ? "Pickup Run — Start Odometer" : "Start Odometer"}
+            </h2>
+            <p className="text-sm text-slate-500 mt-1">Default: your last reading</p>
           </div>
           <div className="bg-white rounded-3xl p-6 shadow-lg border border-slate-200">
             <div className="flex items-center justify-center gap-3">
@@ -431,11 +456,13 @@ export default function TripPage() {
           </div>
           <div className="bg-slate-50 rounded-xl p-3 text-xs text-slate-500 space-y-1">
             <p>📍 {trip.startAddress.slice(0, 80)}</p>
-            <p>🕐 {trip.startTime} • 🛰️ GPS Active</p>
+            <p>🕐 {trip.startTime} • 🛰️ GPS ready</p>
           </div>
           <button onClick={handleConfirmStartOdometer} disabled={!odometerInput || parseFloat(odometerInput) <= 0}
-            className="w-full py-4 bg-indigo-600 hover:bg-indigo-700 text-white text-lg font-bold rounded-2xl disabled:opacity-40 active:scale-[0.98]">
-            ✓ Confirm & Start Driving
+            className={`w-full py-4 text-white text-lg font-bold rounded-2xl disabled:opacity-40 active:scale-[0.98] ${
+              pickupMode ? "bg-amber-600 hover:bg-amber-700" : "bg-indigo-600 hover:bg-indigo-700"
+            }`}>
+            ✓ Confirm & {pickupMode ? "Go Pickup" : "Start Driving"}
           </button>
         </div>
       </div>
@@ -446,42 +473,59 @@ export default function TripPage() {
   if (phase === "driving") {
     return (
       <div className="pb-32 animate-fadeIn">
-        {/* Speed & Status Bar */}
+        {pickupMode && (
+          <div className="bg-amber-100 border border-amber-300 rounded-xl px-4 py-2 mb-3 text-center">
+            <p className="text-sm font-medium text-amber-800">🚕 Pickup mode — heading to passenger</p>
+          </div>
+        )}
+
+        {/* Speed & Status */}
         <div className="bg-white rounded-2xl p-4 shadow-sm border border-slate-100 mb-3">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
-              <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse" />
+              <div className={`w-3 h-3 rounded-full ${currentSpeed > 1 ? "bg-red-500 animate-pulse" : "bg-slate-300"}`} />
               <div>
                 <p className="font-mono text-2xl font-bold text-slate-900">{elapsed}</p>
                 <p className="text-xs text-slate-500">{streetName || "Locating..."}</p>
               </div>
             </div>
             <div className="text-right">
-              <p className={`text-3xl font-bold ${currentSpeed > 50 ? "text-red-600" : "text-slate-900"}`}>
+              <p className={`text-4xl font-bold ${currentSpeed > 50 ? "text-red-600" : currentSpeed > 30 ? "text-amber-600" : "text-slate-900"}`}>
                 {Math.round(currentSpeed)}
               </p>
               <p className="text-xs text-slate-500">km/h</p>
             </div>
           </div>
-          {/* Speed bar */}
           <div className="mt-3 h-2 bg-slate-100 rounded-full overflow-hidden">
             <div className={`h-full rounded-full transition-all ${currentSpeed > 50 ? "bg-red-500" : currentSpeed > 30 ? "bg-amber-500" : "bg-emerald-500"}`}
               style={{ width: `${Math.min(100, (currentSpeed / 120) * 100)}%` }} />
           </div>
-          <div className="flex justify-between mt-1 text-[10px] text-slate-400">
-            <span>0</span><span>30</span><span>60</span><span>90</span><span>120</span>
+        </div>
+
+        {/* LIVE ODOMETER — increments in real time while driving */}
+        <div className="bg-gradient-to-r from-indigo-600 to-purple-700 rounded-2xl p-4 text-white mb-3">
+          <div className="flex justify-between items-center">
+            <div>
+              <p className="text-xs text-white/70">Est. Odometer (Live GPS)</p>
+              <p className="text-3xl font-bold font-mono">{fmtOdo(liveOdo)}</p>
+              <p className="text-xs text-white/70 mt-1">Start: {fmtOdo(trip?.startOdometer)} + GPS: {gpsDistance.toFixed(2)} km</p>
+            </div>
+            <div className="text-right">
+              <div className={`px-3 py-1 rounded-full text-xs font-bold ${currentSpeed < 1 ? "bg-white/20" : "bg-white text-indigo-700"}`}>
+                {currentSpeed < 1 ? "⏸ STATIONARY" : "▶ MOVING"}
+              </div>
+              <p className="text-xs text-white/60 mt-2">{liveLat.toFixed(5)}, {liveLng.toFixed(5)}</p>
+            </div>
           </div>
         </div>
 
-        {/* Alert banner */}
         {speedAlert && (
-          <div className={`px-4 py-3 rounded-xl mb-3 text-center font-medium text-sm animate-fadeIn ${
-            speedAlert === "speed" ? "bg-red-100 text-red-700 border border-red-200" : "bg-amber-100 text-amber-700"
-          }`}>{alertMsg}</div>
+          <div className="bg-red-100 text-red-700 border border-red-200 px-4 py-3 rounded-xl mb-3 text-center font-medium text-sm animate-fadeIn">
+            {alertMsg}
+          </div>
         )}
 
-        {/* Map */}
-        <div className="rounded-2xl overflow-hidden border border-slate-200 mb-3" style={{ height: "45vh" }}>
+        <div className="rounded-2xl overflow-hidden border border-slate-200 mb-3" style={{ height: "38vh" }}>
           <TripMap
             lat={liveLat} lng={liveLng}
             track={positionBufferRef.current.slice(-200)}
@@ -489,26 +533,6 @@ export default function TripPage() {
           />
         </div>
 
-        {/* Stats row */}
-        <div className="grid grid-cols-3 gap-2 mb-3">
-          <div className="bg-white rounded-xl p-3 text-center border border-slate-100">
-            <p className="text-xs text-slate-500">GPS Dist</p>
-            <p className="text-lg font-bold text-indigo-600">{gpsDistance.toFixed(1)}</p>
-            <p className="text-[10px] text-slate-400">km</p>
-          </div>
-          <div className="bg-white rounded-xl p-3 text-center border border-slate-100">
-            <p className="text-xs text-slate-500">Start Odo</p>
-            <p className="text-lg font-bold text-slate-900">{trip?.startOdometer}</p>
-            <p className="text-[10px] text-slate-400">km</p>
-          </div>
-          <div className="bg-white rounded-xl p-3 text-center border border-slate-100">
-            <p className="text-xs text-slate-500">Waypoints</p>
-            <p className="text-lg font-bold text-slate-900">{positionBufferRef.current.length}</p>
-            <p className="text-[10px] text-slate-400">pts</p>
-          </div>
-        </div>
-
-        {/* Stop suggestion (auto-hide) */}
         {stopSuggestion && (
           <div className="bg-amber-50 border border-amber-200 rounded-2xl p-4 mb-3 animate-fadeIn text-center">
             <p className="text-sm font-medium text-amber-700 mb-2">🚗 Vehicle stopped — End this trip?</p>
@@ -517,7 +541,6 @@ export default function TripPage() {
           </div>
         )}
 
-        {/* Stop button */}
         <button onClick={handleStopTrip}
           className="w-full py-5 bg-red-600 hover:bg-red-700 text-white text-xl font-bold rounded-2xl shadow-lg active:scale-[0.98] flex items-center justify-center gap-3">
           <span className="text-3xl">⏹</span> STOP TRIP
@@ -528,17 +551,16 @@ export default function TripPage() {
 
   // ===== ODOMETER END =====
   if (phase === "odometer_end" && trip) {
-    const suggested = trip.startOdometer + Math.max(1, Math.round(gpsDistance));
+    const suggested = trip.startOdometer + Math.max(0.1, gpsDistance);
     const endOdo = parseFloat(endOdometerInput) || 0;
     const dist = endOdo - trip.startOdometer;
-
     return (
       <div className="min-h-[85vh] flex flex-col items-center justify-center pb-32 animate-fadeIn">
         <div className="w-full max-w-sm space-y-5">
           <div className="text-center">
             <span className="text-4xl">📏</span>
             <h2 className="mt-3 text-xl font-bold text-slate-900">End Odometer</h2>
-            <p className="text-sm text-slate-500 mt-1">Duration: {elapsed} • GPS: {gpsDistance.toFixed(1)} km</p>
+            <p className="text-sm text-slate-500 mt-1">Duration: {elapsed} • GPS: {gpsDistance.toFixed(2)} km</p>
           </div>
           <div className="bg-white rounded-3xl p-6 shadow-lg border border-slate-200">
             <div className="flex items-center justify-center gap-3">
@@ -546,7 +568,7 @@ export default function TripPage() {
                 className="w-14 h-14 rounded-2xl bg-slate-100 text-2xl font-bold text-slate-600 active:scale-95">−</button>
               <input type="number" step="0.1" value={endOdometerInput} onChange={e => setEndOdometerInput(e.target.value)}
                 className="w-40 text-center text-4xl font-bold text-slate-900 bg-transparent border-b-4 border-emerald-500 outline-none py-2 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
-                placeholder={String(suggested)} inputMode="decimal" autoFocus />
+                placeholder={String(suggested.toFixed(1))} inputMode="decimal" autoFocus />
               <button onClick={() => setEndOdometerInput((parseFloat(endOdometerInput || String(suggested)) + 0.1).toFixed(1))}
                 className="w-14 h-14 rounded-2xl bg-slate-100 text-2xl font-bold text-slate-600 active:scale-95">+</button>
             </div>
@@ -559,14 +581,20 @@ export default function TripPage() {
           </div>
           {dist > 0 && (
             <div className="bg-emerald-50 rounded-xl p-3 text-center border border-emerald-200">
-              <p className="text-sm text-emerald-700">Distance: <span className="font-bold text-lg">{dist} km</span></p>
-              <p className="text-xs text-emerald-600 mt-1">GPS tracked: {gpsDistance.toFixed(1)} km • Max speed: {trip.maxSpeed} km/h</p>
+              <p className="text-sm text-emerald-700">Distance: <span className="font-bold text-lg">{dist.toFixed(2)} km</span></p>
             </div>
           )}
-          <label className="flex items-center gap-3 p-4 bg-white rounded-xl border border-slate-200 cursor-pointer">
-            <input type="checkbox" checked={isBusinessTrip} onChange={e => setIsBusinessTrip(e.target.checked)} className="w-5 h-5 text-indigo-600 rounded" />
-            <div><p className="font-medium text-slate-900 text-sm">Business Trip</p><p className="text-xs text-slate-500">For ATO tax claims</p></div>
-          </label>
+          {!trip.pickupMode && (
+            <label className="flex items-center gap-3 p-4 bg-white rounded-xl border border-slate-200 cursor-pointer">
+              <input type="checkbox" checked={isBusinessTrip} onChange={e => setIsBusinessTrip(e.target.checked)} className="w-5 h-5 text-indigo-600 rounded" />
+              <div><p className="font-medium text-slate-900 text-sm">Business Trip</p><p className="text-xs text-slate-500">For ATO tax claims</p></div>
+            </label>
+          )}
+          {trip.pickupMode && (
+            <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-center text-sm text-amber-700">
+              🚕 Pickup run — marked as business automatically
+            </div>
+          )}
           <input type="text" value={notes} onChange={e => setNotes(e.target.value)}
             placeholder="Optional note..." className="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500" />
           <button onClick={handleSaveTrip} disabled={!endOdometerInput || parseFloat(endOdometerInput) < trip.startOdometer}
@@ -584,7 +612,7 @@ export default function TripPage() {
       <div className="min-h-[85vh] flex flex-col items-center justify-center pb-32 animate-fadeIn">
         <div className="w-44 h-44 rounded-full bg-blue-100 flex flex-col items-center justify-center animate-pulse-slow">
           <span className="text-5xl mb-2">💾</span>
-          <span className="text-lg font-medium text-blue-700">Saving Trip...</span>
+          <span className="text-lg font-medium text-blue-700">Saving...</span>
         </div>
       </div>
     );
@@ -601,19 +629,18 @@ export default function TripPage() {
           </div>
           <div>
             <h2 className="text-2xl font-bold text-slate-900">Trip Saved!</h2>
-            <p className="text-slate-500 mt-1">Trip #{todayCount} • {dist} km driven</p>
+            <p className="text-slate-500 mt-1">{trip?.pickupMode ? "🚕 Pickup run" : "Trip"} #{todayCount} • {dist.toFixed(1)} km • Source: GPS</p>
           </div>
           <div className="bg-white rounded-2xl p-5 shadow-sm border border-slate-100 text-left space-y-2">
             {trip && <>
               <div className="flex justify-between text-sm"><span className="text-slate-500">Duration</span><span className="font-medium">{elapsed}</span></div>
               <div className="flex justify-between text-sm"><span className="text-slate-500">Odometer</span><span className="font-medium">{fmtOdo(trip.startOdometer)} → {fmtOdo(endOdometerInput)} km</span></div>
-              <div className="flex justify-between text-sm"><span className="text-slate-500">GPS Distance</span><span className="font-medium">{gpsDistance.toFixed(1)} km</span></div>
-              <div className="flex justify-between text-sm"><span className="text-slate-500">Max Speed</span><span className="font-medium">{trip.maxSpeed} km/h</span></div>
+              <div className="flex justify-between text-sm"><span className="text-slate-500">GPS Distance</span><span className="font-medium">{gpsDistance.toFixed(2)} km</span></div>
             </>}
           </div>
           <div className="flex gap-3">
             <button onClick={handleNextTrip} className="flex-1 py-4 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-2xl active:scale-[0.98]">
-              ▶ Start Next Trip
+              ▶ Next Trip
             </button>
             <button onClick={() => router.push("/dashboard")} className="py-4 px-6 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded-2xl">🏠</button>
           </div>
